@@ -1,13 +1,19 @@
 import {
-  $getRoot,
+  $getSelection,
+  $isRangeSelection,
   COMMAND_PRIORITY_NORMAL,
   PASTE_COMMAND,
+} from 'lexical';
+import type {
+  EditorState,
+  LexicalEditor,
 } from 'lexical';
 import type {
   Transformer,
 } from '@lexical/markdown';
 import {
   $convertFromMarkdownString,
+  $convertToMarkdownString,
 } from '@lexical/markdown';
 import {
   useLexicalComposerContext,
@@ -21,14 +27,16 @@ export interface MarkdownPasteConfig {
   /**
    * 'auto' converts detected markdown
    * immediately. 'prompt' calls
-   * onMarkdownDetected first.
+   * onMarkdownDetected first — the raw
+   * text is inserted so the user can see
+   * it while the prompt is shown.
    */
   mode: 'auto' | 'prompt';
 
   /**
    * Called in prompt mode when markdown
    * is detected. Resolve true to convert,
-   * false to paste as plain text.
+   * false to keep as raw text.
    */
   onMarkdownDetected?: (
     text: string,
@@ -45,23 +53,49 @@ export interface MarkdownPasteConfig {
 }
 
 /**
- * Returns true if the editor root is empty
- * (no meaningful text content).
+ * Returns true if the selection anchor is
+ * inside a code block node. Must be called
+ * inside a read or update context.
  */
-function editorIsEmpty(): boolean {
-  return $getRoot().getTextContent().trim() === '';
+export function selectionInsideCode(): boolean {
+  const sel = $getSelection();
+  if (!$isRangeSelection(sel)) return false;
+  let node: ReturnType<
+    typeof sel.anchor.getNode
+  > | null = sel.anchor.getNode();
+  while (node !== null) {
+    if (node.getType() === 'code') {
+      return true;
+    }
+    node = node.getParent();
+  }
+  return false;
 }
 
-function convertMarkdown(
-  editor: ReturnType<
-    typeof useLexicalComposerContext
-  >[0],
-  text: string,
+/**
+ * Reads existing markdown from an editor
+ * state, combines it with pasted markdown,
+ * and converts the result to rich nodes.
+ */
+export function combineAndConvert(
+  editor: LexicalEditor,
+  preState: EditorState,
+  pastedText: string,
   transformers?: Transformer[],
 ) {
+  let existingMd = '';
+  preState.read(() => {
+    existingMd =
+      $convertToMarkdownString(transformers);
+  });
+
+  const combined = existingMd
+    ? existingMd + '\n\n' + pastedText
+    : pastedText;
+
   editor.update(() => {
     $convertFromMarkdownString(
-      text,
+      combined,
       transformers,
     );
   });
@@ -72,11 +106,13 @@ function convertMarkdown(
  * and converts detected markdown into rich
  * Lexical nodes.
  *
- * Conversion only happens when the editor is
- * empty. If the editor already has content,
- * the event is passed to the default handler
- * (plain-text paste) to avoid silently
- * destroying existing work.
+ * Works in both empty and non-empty editors.
+ * Paste inside code blocks is never
+ * intercepted. In auto mode, conversion is
+ * immediate. In prompt mode, the raw text
+ * is inserted first and onMarkdownDetected
+ * is called — resolve true to convert, false
+ * to keep the raw text.
  */
 export function MarkdownPastePlugin({
   mode,
@@ -100,40 +136,49 @@ export function MarkdownPastePlugin({
           return false;
         }
 
-        // Check emptiness inside a read-only
-        // editor state to avoid side effects.
-        let isEmpty = false;
+        // Never intercept paste inside code
+        let insideCode = false;
         editor.getEditorState().read(() => {
-          isEmpty = editorIsEmpty();
+          insideCode = selectionInsideCode();
         });
-
-        if (!isEmpty) {
-          // Editor has content — don't replace.
-          // Fall through to default paste handler
-          // so the text is inserted safely.
-          return false;
-        }
+        if (insideCode) return false;
 
         event.preventDefault();
 
         if (mode === 'auto') {
-          convertMarkdown(
+          combineAndConvert(
             editor,
+            editor.getEditorState(),
             text,
             transformers,
           );
           return true;
         }
 
+        // Prompt: save state before inserting
+        // raw text so we can restore on convert.
+        const preState =
+          editor.getEditorState();
+
+        editor.update(() => {
+          const sel = $getSelection();
+          if ($isRangeSelection(sel)) {
+            sel.insertRawText(text);
+          }
+        });
+
         if (onMarkdownDetected) {
           onMarkdownDetected(text).then(
             (accepted) => {
-              if (!accepted) return;
-              convertMarkdown(
-                editor,
-                text,
-                transformers,
-              );
+              if (accepted) {
+                combineAndConvert(
+                  editor,
+                  preState,
+                  text,
+                  transformers,
+                );
+              }
+              // Reject: raw text stays as-is
             },
           );
         }
